@@ -14,9 +14,10 @@ import contextlib
 import copy
 import functools
 import logging
-import os.path
+import os
 import re
 import socket
+import stat
 import sys
 import time
 import urlparse
@@ -283,8 +284,13 @@ class _HTTPConnection(object):
             else:
                 assert self.request.body is None
         if self.request.body is not None:
-            self.request.headers["Content-Length"] = str(len(
-                    self.request.body))
+            if isinstance(self.request.body, file):
+                size = os.fstat(self.request.body.fileno())[stat.ST_SIZE]
+                size -= self.request.body.tell()
+            else:
+                size = len(self.request.body)
+
+            self.request.headers["Content-Length"] = str(size)
         if (self.request.method == "POST" and
             "Content-Type" not in self.request.headers):
             self.request.headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -300,9 +306,17 @@ class _HTTPConnection(object):
                 raise ValueError('Newline in header: ' + repr(line))
             request_lines.append(line)
         self.stream.write(b("\r\n").join(request_lines) + b("\r\n\r\n"))
-        if self.request.body is not None:
+        if isinstance(self.request.body, file):
+            self._write_streaming_body()
+        elif self.request.body is not None:
             self.stream.write(self.request.body)
         self.stream.read_until_regex(b("\r?\n\r?\n"), self._on_headers)
+
+    def _write_streaming_body(self):
+        WRITE_BUFFER_CHUNK_SIZE = 128 * 1024
+        data = self.request.body.read(WRITE_BUFFER_CHUNK_SIZE)
+        if data:
+            self.stream.write(data, callback=self._write_streaming_body)
 
     def _release(self):
         if self.release_callback is not None:
