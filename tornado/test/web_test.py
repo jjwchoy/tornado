@@ -5,7 +5,7 @@ from tornado.iostream import IOStream
 from tornado.template import DictLoader
 from tornado.testing import LogTrapTestCase, AsyncHTTPTestCase
 from tornado.util import b, bytes_type, ObjectDict
-from tornado.web import RequestHandler, authenticated, Application, asynchronous, url, HTTPError, StaticFileHandler, _create_signature
+from tornado.web import RequestHandler, authenticated, Application, asynchronous, url, HTTPError, StaticFileHandler, _create_signature, create_signed_value
 
 import binascii
 import logging
@@ -13,6 +13,16 @@ import os
 import re
 import socket
 import sys
+
+
+class SimpleHandlerTestCase(AsyncHTTPTestCase):
+    """Simplified base class for tests that work with a single handler class.
+
+    To use, define a nested class named ``Handler``.
+    """
+    def get_app(self):
+        return Application([('/', self.Handler)],
+                           log_function=lambda x: None)
 
 
 class CookieTestRequestHandler(RequestHandler):
@@ -60,6 +70,13 @@ class SecureCookieTest(LogTrapTestCase):
         # it gets rejected
         assert handler.get_secure_cookie('foo') is None
 
+    def test_arbitrary_bytes(self):
+        # Secure cookies accept arbitrary data (which is base64 encoded).
+        # Note that normal cookies accept only a subset of ascii.
+        handler = CookieTestRequestHandler()
+        handler.set_secure_cookie('foo', b('\xe9'))
+        self.assertEqual(handler.get_secure_cookie('foo'), b('\xe9'))
+
 
 class CookieTest(AsyncHTTPTestCase, LogTrapTestCase):
     def get_app(self):
@@ -91,7 +108,7 @@ class CookieTest(AsyncHTTPTestCase, LogTrapTestCase):
         class SetCookieOverwriteHandler(RequestHandler):
             def get(self):
                 self.set_cookie("a", "b", domain="example.com")
-                self.set_cookie("c", "d" ,domain="example.com")
+                self.set_cookie("c", "d", domain="example.com")
                 # A second call with the same name clobbers the first.
                 # Attributes from the first call are not carried over.
                 self.set_cookie("a", "e")
@@ -227,7 +244,7 @@ class ConnectionCloseTest(AsyncHTTPTestCase, LogTrapTestCase):
 
 
 class EchoHandler(RequestHandler):
-    def get(self, path):
+    def get(self, *path_args):
         # Type checks: web.py interfaces convert argument values to
         # unicode strings (by default, but see also decode_argument).
         # In httpserver.py (i.e. self.request.arguments), they're left
@@ -238,27 +255,48 @@ class EchoHandler(RequestHandler):
                 assert type(value) == bytes_type, repr(value)
             for value in self.get_arguments(key):
                 assert type(value) == unicode, repr(value)
-        assert type(path) == unicode, repr(path)
-        self.write(dict(path=path,
+        for arg in path_args:
+            assert type(arg) == unicode, repr(arg)
+        self.write(dict(path=self.request.path,
+                        path_args=path_args,
                         args=recursive_unicode(self.request.arguments)))
 
 
 class RequestEncodingTest(AsyncHTTPTestCase, LogTrapTestCase):
     def get_app(self):
-        return Application([("/(.*)", EchoHandler)])
+        return Application([
+                ("/group/(.*)", EchoHandler),
+                ("/slashes/([^/]*)/([^/]*)", EchoHandler),
+                ])
 
-    def test_question_mark(self):
+    def fetch_json(self, path):
+        return json_decode(self.fetch(path).body)
+
+    def test_group_question_mark(self):
         # Ensure that url-encoded question marks are handled properly
-        self.assertEqual(json_decode(self.fetch('/%3F').body),
-                         dict(path='?', args={}))
-        self.assertEqual(json_decode(self.fetch('/%3F?%3F=%3F').body),
-                         dict(path='?', args={'?': ['?']}))
+        self.assertEqual(self.fetch_json('/group/%3F'),
+                         dict(path='/group/%3F', path_args=['?'], args={}))
+        self.assertEqual(self.fetch_json('/group/%3F?%3F=%3F'),
+                         dict(path='/group/%3F', path_args=['?'], args={'?': ['?']}))
 
-    def test_path_encoding(self):
+    def test_group_encoding(self):
         # Path components and query arguments should be decoded the same way
-        self.assertEqual(json_decode(self.fetch('/%C3%A9?arg=%C3%A9').body),
-                         {u"path": u"\u00e9",
+        self.assertEqual(self.fetch_json('/group/%C3%A9?arg=%C3%A9'),
+                         {u"path": u"/group/%C3%A9",
+                          u"path_args": [u"\u00e9"],
                           u"args": {u"arg": [u"\u00e9"]}})
+
+    def test_slashes(self):
+        # Slashes may be escaped to appear as a single "directory" in the path,
+        # but they are then unescaped when passed to the get() method.
+        self.assertEqual(self.fetch_json('/slashes/foo/bar'),
+                         dict(path="/slashes/foo/bar",
+                              path_args=["foo", "bar"],
+                              args={}))
+        self.assertEqual(self.fetch_json('/slashes/a%2Fb/c%2Fd'),
+                         dict(path="/slashes/a%2Fb/c%2Fd",
+                              path_args=["a/b", "c/d"],
+                              args={}))
 
 
 class TypeCheckHandler(RequestHandler):
@@ -272,6 +310,12 @@ class TypeCheckHandler(RequestHandler):
         self.check_type('argument', self.get_argument('foo'), unicode)
         self.check_type('cookie_key', self.cookies.keys()[0], str)
         self.check_type('cookie_value', self.cookies.values()[0].value, str)
+
+        # Secure cookies return bytes because they can contain arbitrary
+        # data, but regular cookies are native strings.
+        assert self.cookies.keys() == ['asdf']
+        self.check_type('get_secure_cookie', self.get_secure_cookie('asdf'), bytes_type)
+        self.check_type('get_cookie', self.get_cookie('asdf'), str)
 
         self.check_type('xsrf_token', self.xsrf_token, bytes_type)
         self.check_type('xsrf_form_html', self.xsrf_form_html(), str)
@@ -367,6 +411,7 @@ class RedirectHandler(RequestHandler):
         else:
             raise Exception("didn't get permanent or status arguments")
 
+
 class EmptyFlushCallbackHandler(RequestHandler):
     @gen.engine
     @asynchronous
@@ -392,6 +437,8 @@ class HeaderInjectionHandler(RequestHandler):
 
 
 class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
+    COOKIE_SECRET = "WebTest.COOKIE_SECRET"
+
     def get_app(self):
         loader = DictLoader({
                 "linkify.html": "{% module linkify(message) %}",
@@ -407,7 +454,7 @@ class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
                 })
         urls = [
             url("/typecheck/(.*)", TypeCheckHandler, name='typecheck'),
-            url("/decode_arg/(.*)", DecodeArgHandler),
+            url("/decode_arg/(.*)", DecodeArgHandler, name='decode_arg'),
             url("/decode_arg_kw/(?P<arg>.*)", DecodeArgHandler),
             url("/linkify", LinkifyHandler),
             url("/uimodule_resources", UIModuleResourceHandler),
@@ -418,9 +465,11 @@ class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
             url("/empty_flush", EmptyFlushCallbackHandler),
             url("/header_injection", HeaderInjectionHandler),
             ]
-        return Application(urls,
-                           template_loader=loader,
-                           autoescape="xhtml_escape")
+        self.app = Application(urls,
+                               template_loader=loader,
+                               autoescape="xhtml_escape",
+                               cookie_secret=self.COOKIE_SECRET)
+        return self.app
 
     def fetch_json(self, *args, **kwargs):
         response = self.fetch(*args, **kwargs)
@@ -428,13 +477,15 @@ class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
         return json_decode(response.body)
 
     def test_types(self):
+        cookie_value = to_unicode(create_signed_value(self.COOKIE_SECRET,
+                                                      "asdf", "qwer"))
         response = self.fetch("/typecheck/asdf?foo=bar",
-                              headers={"Cookie": "cook=ie"})
+                              headers={"Cookie": "asdf=" + cookie_value})
         data = json_decode(response.body)
         self.assertEqual(data, {})
 
         response = self.fetch("/typecheck/asdf?foo=bar", method="POST",
-                              headers={"Cookie": "cook=ie"},
+                              headers={"Cookie": "asdf=" + cookie_value},
                               body="foo=bar")
 
     def test_decode_argument(self):
@@ -457,6 +508,16 @@ class WebTest(AsyncHTTPTestCase, LogTrapTestCase):
         self.assertEqual(data, {u'path': [u'bytes', u'c3a9'],
                                 u'query': [u'bytes', u'c3a9'],
                                 })
+
+    def test_reverse_url(self):
+        self.assertEqual(self.app.reverse_url('decode_arg', 'foo'),
+                         '/decode_arg/foo')
+        self.assertEqual(self.app.reverse_url('decode_arg', 42),
+                         '/decode_arg/42')
+        self.assertEqual(self.app.reverse_url('decode_arg', b('\xe9')),
+                         '/decode_arg/%E9')
+        self.assertEqual(self.app.reverse_url('decode_arg', u'\u00e9'),
+                         '/decode_arg/%C3%A9')
 
     def test_uimodule_unescaped(self):
         response = self.fetch("/linkify")
@@ -665,6 +726,14 @@ class StaticFileTest(AsyncHTTPTestCase, LogTrapTestCase):
         response = self.fetch(path % int(include_host))
         self.assertEqual(response.body, utf8(str(True)))
 
+    def test_static_304(self):
+        response1 = self.fetch("/static/robots.txt")
+        response2 = self.fetch("/static/robots.txt", headers={
+                'If-Modified-Since': response1.headers['Last-Modified']})
+        self.assertEqual(response2.code, 304)
+        self.assertTrue('Content-Length' not in response2.headers)
+        self.assertTrue('Last-Modified' not in response2.headers)
+
 
 class CustomStaticFileTest(AsyncHTTPTestCase, LogTrapTestCase):
     def get_app(self):
@@ -676,7 +745,7 @@ class CustomStaticFileTest(AsyncHTTPTestCase, LogTrapTestCase):
 
             @classmethod
             def make_static_url(cls, settings, path):
-                version_hash = cls.get_version(settings, path)
+                cls.get_version(settings, path)
                 extension_index = path.rindex('.')
                 before_version = path[:extension_index]
                 after_version = path[(extension_index + 1):]
@@ -705,6 +774,7 @@ class CustomStaticFileTest(AsyncHTTPTestCase, LogTrapTestCase):
         response = self.fetch("/static_url/foo.txt")
         self.assertEqual(response.body, b("/static/foo.42.txt"))
 
+
 class NamedURLSpecGroupsTest(AsyncHTTPTestCase, LogTrapTestCase):
     def get_app(self):
         class EchoHandler(RequestHandler):
@@ -720,3 +790,37 @@ class NamedURLSpecGroupsTest(AsyncHTTPTestCase, LogTrapTestCase):
 
         response = self.fetch("/unicode/bar")
         self.assertEqual(response.body, b("bar"))
+
+
+class ClearHeaderTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        def get(self):
+            self.set_header("h1", "foo")
+            self.set_header("h2", "bar")
+            self.clear_header("h1")
+            self.clear_header("nonexistent")
+
+    def test_clear_header(self):
+        response = self.fetch("/")
+        self.assertTrue("h1" not in response.headers)
+        self.assertEqual(response.headers["h2"], "bar")
+
+
+class Header304Test(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        def get(self):
+            self.set_header("Content-Language", "en_US")
+            self.write("hello")
+
+    def test_304_headers(self):
+        response1 = self.fetch('/')
+        self.assertEqual(response1.headers["Content-Length"], "5")
+        self.assertEqual(response1.headers["Content-Language"], "en_US")
+
+        response2 = self.fetch('/', headers={
+                'If-None-Match': response1.headers["Etag"]})
+        self.assertEqual(response2.code, 304)
+        self.assertTrue("Content-Length" not in response2.headers)
+        self.assertTrue("Content-Language" not in response2.headers)
+        # Not an entity header, but should not be added to 304s by chunking
+        self.assertTrue("Transfer-Encoding" not in response2.headers)
